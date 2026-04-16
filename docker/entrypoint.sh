@@ -55,7 +55,24 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 # --- Running as hermes from here ---
-source "${INSTALL_DIR}/.venv/bin/activate"
+source /opt/venv/bin/activate
+
+# Named volumes start empty — populate node_modules and web dist on first run.
+# This handles fresh `docker compose down -v && up` without manual intervention.
+if [ ! -d "${INSTALL_DIR}/node_modules/vite" ]; then
+    echo "Initializing node_modules (first run or volume was cleared)..."
+    cd "${INSTALL_DIR}" && npm install --prefer-offline --no-audit 2>/dev/null || true
+    if [ -d "${INSTALL_DIR}/scripts/whatsapp-bridge" ]; then
+        cd "${INSTALL_DIR}/scripts/whatsapp-bridge" && npm install --prefer-offline --no-audit 2>/dev/null || true
+    fi
+    cd "${INSTALL_DIR}"
+fi
+
+if [ ! -f "${INSTALL_DIR}/hermes_cli/web_dist/index.html" ]; then
+    echo "Building dashboard web UI (first run or volume was cleared)..."
+    cd "${INSTALL_DIR}/web" && npm run build 2>/dev/null || true
+    cd "${INSTALL_DIR}"
+fi
 
 # Create essential directory structure.  Cache and platform directories
 # (cache/images, cache/audio, platforms/whatsapp, etc.) are created on

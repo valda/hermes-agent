@@ -5,16 +5,25 @@ FROM debian:13.4
 # Disable Python stdout buffering to ensure logs are printed immediately
 ENV PYTHONUNBUFFERED=1
 
-# Store Playwright browsers outside the volume mount so the build-time
-# install survives the /opt/data volume overlay at runtime.
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
+# Store Playwright browsers outside /opt/hermes so the build-time
+# install survives both the /opt/data volume overlay and the source
+# bind-mount at /opt/hermes used in dev environments.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 
 # Install system dependencies in one layer, clear APT cache
 # tini reaps orphaned zombie processes (MCP stdio subprocesses, git, bun, etc.)
 # that would otherwise accumulate when hermes runs as PID 1. See #15012.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    build-essential curl nodejs npm python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli tini && \
+        build-essential nodejs npm python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git \
+        openssh-client docker-cli tini \
+        curl gpg vim-tiny less jq file sqlite3 tree imagemagick && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+         -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+         > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
@@ -22,6 +31,15 @@ RUN useradd -u 10000 -m -d /opt/data hermes
 
 COPY --chmod=0755 --from=gosu_source /gosu /usr/local/bin/
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+
+# google-workspace スキルの OAuth 認証で動的 pip install が
+# Debian externally-managed-environment に弾かれるのを回避
+RUN uv pip install \
+      --python /usr/bin/python3 \
+      --target /opt/google-libs \
+      --no-cache \
+      google-api-python-client google-auth-oauthlib google-auth-httplib2
+ENV PYTHONPATH=/opt/google-libs
 
 WORKDIR /opt/hermes
 
@@ -61,11 +79,18 @@ RUN chmod -R a+rX /opt/hermes
 # Start as root so the entrypoint can usermod/groupmod + gosu.
 # If HERMES_UID is unset, the entrypoint drops to the default hermes user (10000).
 
-# ---------- Python virtualenv ----------
-RUN uv venv && \
+# ---------- Python virtualenv (/opt/venv 外出し、source mount 対応) ----------
+RUN chown -R hermes:hermes /opt/hermes
+USER hermes
+RUN uv venv /opt/venv && \
+    VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH" \
     uv pip install --no-cache-dir -e ".[all]"
 
-# ---------- Runtime ----------
+USER root
+RUN chmod +x /opt/hermes/docker/entrypoint.sh
+
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_HOME=/opt/data
 ENV PATH="/opt/data/.local/bin:${PATH}"
