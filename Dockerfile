@@ -80,6 +80,7 @@ RUN chmod -R a+rX /opt/hermes
 # If HERMES_UID is unset, the entrypoint drops to the default hermes user (10000).
 
 # ---------- Python virtualenv (/opt/venv 外出し、source mount 対応) ----------
+RUN mkdir -p /opt/venv && chown hermes:hermes /opt/venv
 RUN chown -R hermes:hermes /opt/hermes
 USER hermes
 RUN uv venv /opt/venv && \
