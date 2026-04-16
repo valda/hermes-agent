@@ -2103,7 +2103,14 @@ class HermesCLI:
         self._providers_order = pr.get("order")
         self._provider_require_params = pr.get("require_parameters", False)
         self._provider_data_collection = pr.get("data_collection")
-        
+
+        # Sampling extras (temperature / top_p / repetition_penalty / top_k / etc)
+        # read from model.sampling_extras. Dispatched in run_agent._build_api_kwargs:
+        # SDK-standard keys (temperature, top_p, frequency_penalty, presence_penalty,
+        # stop, seed) go to top-level api_kwargs; others (repetition_penalty, top_k,
+        # min_p, ...) are forwarded via extra_body for OpenRouter / vLLM-style backends.
+        self._sampling_extras = (CLI_CONFIG.get("model", {}) or {}).get("sampling_extras", {}) or {}
+
         # Fallback provider chain — tried in order when primary fails after retries.
         # Supports new list format (fallback_providers) and legacy single-dict (fallback_model).
         fb = CLI_CONFIG.get("fallback_providers") or CLI_CONFIG.get("fallback_model") or []
@@ -3516,6 +3523,7 @@ class HermesCLI:
                 provider_sort=self._provider_sort,
                 provider_require_parameters=self._provider_require_params,
                 provider_data_collection=self._provider_data_collection,
+                sampling_extras=self._sampling_extras,
                 session_id=self.session_id,
                 platform="cli",
                 session_db=self._session_db,
@@ -6622,6 +6630,7 @@ class HermesCLI:
                     provider_sort=self._provider_sort,
                     provider_require_parameters=self._provider_require_params,
                     provider_data_collection=self._provider_data_collection,
+                    sampling_extras=self._sampling_extras,
                     fallback_model=self._fallback_model,
                 )
                 # Silence raw spinner; route thinking through TUI widget when no foreground agent is active.

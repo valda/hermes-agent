@@ -927,6 +927,7 @@ class AIAgent:
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
         request_overrides: Dict[str, Any] = None,
+        sampling_extras: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
@@ -1198,6 +1199,7 @@ class AIAgent:
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
         self.service_tier = service_tier
         self.request_overrides = dict(request_overrides or {})
+        self.sampling_extras = dict(sampling_extras or {})
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         self._force_ascii_payload = False
         
@@ -8335,6 +8337,29 @@ class AIAgent:
         if _ephemeral_out is not None:
             self._ephemeral_max_output_tokens = None
 
+        # Sampling extras from config (model.sampling_extras). SDK-known keys
+        # piggyback on request_overrides so they land in api_kwargs top-level
+        # (user request_overrides still wins); non-SDK keys go through
+        # extra_body_additions for OpenRouter / vLLM-style backends. Only the
+        # chat_completions path picks them up; Anthropic / Codex ignore them.
+        _sampling_overrides: Dict[str, Any] = {}
+        _sampling_extra_body: Dict[str, Any] = {}
+        if self.sampling_extras and self.api_mode == "chat_completions":
+            _SDK_TOP_LEVEL = {
+                "temperature", "top_p", "frequency_penalty",
+                "presence_penalty", "stop", "seed",
+            }
+            for _k, _v in self.sampling_extras.items():
+                if _k in _SDK_TOP_LEVEL:
+                    _sampling_overrides[_k] = _v
+                else:
+                    _sampling_extra_body[_k] = _v
+        _merged_overrides = (
+            {**_sampling_overrides, **(self.request_overrides or {})}
+            if (_sampling_overrides or self.request_overrides)
+            else None
+        )
+
         # Strip image parts for non-vision models (no-op when vision-capable).
         _msgs_for_chat = self._prepare_messages_for_non_vision_model(api_messages)
 
@@ -8348,7 +8373,7 @@ class AIAgent:
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=self._max_tokens_param,
             reasoning_config=self.reasoning_config,
-            request_overrides=self.request_overrides,
+            request_overrides=_merged_overrides,
             session_id=getattr(self, "session_id", None),
             model_lower=(self.model or "").lower(),
             is_openrouter=_is_or,
@@ -8372,6 +8397,7 @@ class AIAgent:
             lmstudio_reasoning_options=self._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
             anthropic_max_output=_ant_max,
             provider_name=self.provider,
+            extra_body_additions=_sampling_extra_body or None,
         )
 
     def _supports_reasoning_extra_body(self) -> bool:
