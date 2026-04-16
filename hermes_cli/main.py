@@ -5303,6 +5303,14 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     """
     if not (web_dir / "package.json").exists():
         return True
+    # Prebuilt bundle shortcut: when the Vite output already exists, treat
+    # the build as complete and skip `npm install` / `npm run build`.
+    # Hermes's default path rebuilds unconditionally, which fails under a
+    # read-only /opt/hermes owned by root when the process runs as UID 1000.
+    # NOTE: vite.config.ts points outDir at ../hermes_cli/web_dist, so the
+    # compiled index.html lives beside the Python sources, not under web/.
+    if (web_dir.parent / "hermes_cli" / "web_dist" / "index.html").exists():
+        return True
 
     if not _web_ui_build_needed(web_dir):
         return True
