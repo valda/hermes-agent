@@ -387,12 +387,19 @@ class ContextCompressor(ContextEngine):
         config_context_length: int | None = None,
         provider: str = "",
         api_mode: str = "",
+        codex_native: bool = False,
     ):
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
         self.provider = provider
         self.api_mode = api_mode
+        # When true and the main agent provider is openai-codex, the
+        # compressor calls Codex's native /responses/compact endpoint instead
+        # of generating a text summary.  See agent.codex_compactor.  The
+        # main agent provider lives in self.provider; auxiliary.compression.*
+        # is unused on this path because the call reuses main's Codex auth.
+        self.codex_native = bool(codex_native)
         self.threshold_percent = threshold_percent
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
@@ -1229,6 +1236,156 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         return compress_start < compress_end
 
     # ------------------------------------------------------------------
+    # Codex native compaction (opt-in, openai-codex provider only)
+    # ------------------------------------------------------------------
+
+    def _compress_via_codex_responses(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: Optional[int] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Compress by calling Codex /responses/compact directly.
+
+        Returns the new messages list on success, or ``None`` if the input is
+        too short to compact (caller should leave messages untouched).
+        Raises on transport / API errors so the caller can fall back.
+
+        Contract — server-side keep policy:
+            Unlike the text-summary path in :py:meth:`compress`, this method
+            sends the **full** conversation body (everything after the system
+            message) to ``/responses/compact`` and accepts whatever
+            replacement transcript the Codex backend returns.  The
+            text-summary path's client-side truncation / boundary invariants
+            (``protect_first_n``, ``protect_last_n``, tail token budget,
+            "always keep latest user message", and the cut-induced
+            tool-call/tool-result pair re-alignment that
+            ``_align_boundary_forward`` performs) **do not apply** on this
+            path — the server owns those decisions, so we do not pre-trim
+            the transcript.  ``_chat_messages_to_responses_input`` is still
+            responsible for emitting a well-formed Responses input.  This
+            mirrors codex-rs's ``run_remote_compact_task`` and is required
+            for iterative compaction (replaying a prior
+            ``compaction`` back into the next call) to work
+            coherently.
+
+            ``protect_first_n`` is still honoured *as a lower bound on
+            history length* below — fewer messages than the head budget +
+            a couple of turns is treated as "too short to bother compacting"
+            — but it does not cause head messages to be excluded from the
+            ``/compact`` request.
+        """
+        # Imports kept local — keeps the cross-provider path zero-cost when
+        # Codex native compaction isn't enabled.
+        from agent.auxiliary_client import (
+            _codex_cloudflare_headers,
+            _read_codex_access_token,
+        )
+        from agent.codex_compactor import (
+            CodexCompactionError,
+            build_compaction_envelope,
+            compact_via_codex_responses,
+        )
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+        # Need at least head + a couple of turns to bother compacting.  Bail
+        # out clean (return None) so the existing "too short to compact"
+        # behavior (no-op) is preserved.
+        n_messages = len(messages)
+        if n_messages <= self.protect_first_n + 2:
+            return None
+
+        access_token = _read_codex_access_token()
+        if not access_token:
+            raise CodexCompactionError(
+                "no Codex OAuth access token available — cannot use native compaction"
+            )
+
+        # Extract system instructions from the first system message (the
+        # Codex transport does the same in build_kwargs).
+        instructions = ""
+        body_messages = messages
+        if messages and messages[0].get("role") == "system":
+            sys_content = messages[0].get("content")
+            if isinstance(sys_content, str):
+                instructions = sys_content
+            elif isinstance(sys_content, list):
+                instructions = "".join(
+                    p.get("text", "") for p in sys_content if isinstance(p, dict)
+                )
+            body_messages = messages[1:]
+
+        # Reuse the production message converter so tool_calls / reasoning
+        # items / multimodal parts are all lifted to Responses shape exactly
+        # the way the live transport would have done them.  The converter
+        # already expands any prior _codex_responses_items envelope inline,
+        # so an iterative compaction sends the previous compaction
+        # back to /compact alongside fresh turns — the server decrypts and
+        # re-summarizes, preserving long-range history across many compactions.
+        input_items = _chat_messages_to_responses_input(body_messages)
+        if not input_items:
+            return None
+
+        base_url = (self.base_url or "").rstrip("/") or "https://chatgpt.com/backend-api/codex"
+        # Strip the SDK-style /v1 suffix some auxiliary configs carry — the
+        # Codex backend rejects it on the compact path.
+        if base_url.endswith("/v1"):
+            base_url = base_url[: -len("/v1")]
+
+        cf_headers = _codex_cloudflare_headers(access_token)
+
+        result = compact_via_codex_responses(
+            input_items=input_items,
+            instructions=instructions,
+            model=self.model,
+            base_url=base_url,
+            access_token=access_token,
+            extra_headers=cf_headers,
+        )
+
+        envelope = build_compaction_envelope(
+            output_items=result["output"],
+            n_compressed=len(body_messages),
+        )
+
+        new_messages: List[Dict[str, Any]] = []
+        if messages and messages[0].get("role") == "system":
+            new_messages.append(messages[0])
+        new_messages.append(envelope)
+
+        # Track post-compaction effectiveness using the same fields the text
+        # path uses, so anti-thrashing and gateway notifications keep working.
+        display_tokens = (
+            current_tokens
+            if current_tokens
+            else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
+        )
+        new_estimate = estimate_messages_tokens_rough(new_messages)
+        saved = display_tokens - new_estimate
+        savings_pct = (saved / display_tokens * 100) if display_tokens > 0 else 0.0
+        self._last_compression_savings_pct = savings_pct
+        if savings_pct < 10:
+            self._ineffective_compression_count += 1
+        else:
+            self._ineffective_compression_count = 0
+        self.compression_count += 1
+
+        if not self.quiet_mode:
+            usage = result.get("usage") or {}
+            logger.info(
+                "Codex native compaction #%d: %d -> %d messages "
+                "(~%d tokens saved, %.0f%%, compact tokens in/out=%s/%s)",
+                self.compression_count,
+                n_messages,
+                len(new_messages),
+                saved,
+                savings_pct,
+                usage.get("input_tokens"),
+                usage.get("output_tokens"),
+            )
+
+        return new_messages
+
+    # ------------------------------------------------------------------
     # Main compression entry point
     # ------------------------------------------------------------------
 
@@ -1258,6 +1415,71 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self._last_summary_error = None
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
+
+        # Codex native compaction: opt-in flag (compression.codex_native)
+        # gated on provider==openai-codex.  Bypasses the text-summary pipeline
+        # below and asks the Codex backend to produce an opaque compaction
+        # via /responses/compact.
+        #
+        # Fallback policy: if the message list does NOT yet contain a prior
+        # ``_codex_responses_items`` envelope, native failures fall through
+        # to the text-summary path so a transient backend hiccup still
+        # produces *some* compression.  But once the history already
+        # contains an opaque envelope, the text-summary path would only
+        # see its display label (``[Codex compaction: ...]``) and would
+        # irrecoverably collapse the encrypted summary into text — losing
+        # access to every prior turn that has been folded into it.  In
+        # that case we abort compression for this turn and return the
+        # messages unchanged; the next compaction attempt can retry.
+        if self.codex_native and self.provider == "openai-codex":
+            from agent.codex_compactor import CodexNoCompactionError
+
+            has_existing_envelope = any(
+                isinstance(m, dict) and m.get("_codex_responses_items")
+                for m in messages
+            )
+            try:
+                compressed = self._compress_via_codex_responses(messages, current_tokens=current_tokens)
+                if compressed is not None:
+                    return compressed
+                # Native path returned None (e.g. too-short history, or the
+                # converter produced no input items).  If we already carry
+                # an opaque envelope, the text-summary path would turn the
+                # encrypted summary into plain text — same lossy outcome as
+                # the exception case below.  Bail out to a no-op instead.
+                if has_existing_envelope:
+                    logger.warning(
+                        "Codex native compaction skipped (returned None) and history "
+                        "already contains an opaque compaction envelope — not falling "
+                        "back to the text-summary path."
+                    )
+                    return messages
+            except CodexNoCompactionError as e:
+                logger.info(
+                    "Codex native compaction produced no compaction item (%s) — "
+                    "leaving messages unchanged",
+                    e,
+                )
+                self._last_summary_error = str(e)
+                return messages
+            except Exception as e:
+                if has_existing_envelope:
+                    logger.warning(
+                        "Codex native compaction failed (%s) and history already "
+                        "contains an opaque compaction envelope — skipping this "
+                        "compaction attempt rather than falling through to the "
+                        "text-summary path (which would collapse the encrypted "
+                        "summary into plain text and break replay).",
+                        e,
+                    )
+                    self._last_summary_error = str(e)
+                    return messages
+                logger.warning(
+                    "Codex native compaction failed (%s) — falling back to "
+                    "text-summary compactor",
+                    e,
+                )
+
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self.protect_first_n + 3 + 1

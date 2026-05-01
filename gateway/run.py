@@ -9328,6 +9328,7 @@ class GatewayRunner:
                     reasoning_details=msg.get("reasoning_details"),
                     codex_reasoning_items=msg.get("codex_reasoning_items"),
                     codex_message_items=msg.get("codex_message_items"),
+                    codex_responses_items=msg.get("_codex_responses_items"),
                 )
             except Exception:
                 pass  # Best-effort copy
@@ -12557,6 +12558,13 @@ class GatewayRunner:
                                 _rval = msg.get(_rkey)
                                 if _rval:
                                     entry[_rkey] = _rval
+                        # Codex /responses/compact envelope rides on a
+                        # synthetic user-role marker message — preserve it
+                        # so the next /responses call can replay the
+                        # opaque compaction.
+                        _envelope = msg.get("_codex_responses_items")
+                        if _envelope:
+                            entry["_codex_responses_items"] = _envelope
                         agent_history.append(entry)
             
             # Collect MEDIA paths already in history so we can exclude them

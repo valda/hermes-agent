@@ -21,14 +21,20 @@ def _make_agent(
     compression_enabled: bool = True,
     threshold_percent: float = 0.50,
     main_context: int = 200_000,
+    provider: str = "openrouter",
+    codex_native: bool = False,
 ) -> AIAgent:
     """Build a minimal AIAgent with a compressor, skipping __init__."""
     agent = AIAgent.__new__(AIAgent)
     agent.model = "test-main-model"
-    agent.provider = "openrouter"
-    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.provider = provider
+    agent.base_url = (
+        "https://chatgpt.com/backend-api/codex"
+        if provider == "openai-codex"
+        else "https://openrouter.ai/api/v1"
+    )
     agent.api_key = "sk-test"
-    agent.api_mode = "chat_completions"
+    agent.api_mode = "codex_responses" if provider == "openai-codex" else "chat_completions"
     agent.quiet_mode = True
     agent.log_prefix = ""
     agent.compression_enabled = compression_enabled
@@ -46,12 +52,30 @@ def _make_agent(
     compressor = MagicMock(spec=ContextCompressor)
     compressor.context_length = main_context
     compressor.threshold_tokens = int(main_context * threshold_percent)
+    compressor.codex_native = codex_native
+    compressor.provider = provider
     agent.context_compressor = compressor
 
     return agent
 
 
 # ── Core warning logic ──────────────────────────────────────────────
+
+
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_skips_auxiliary_probe_for_native_codex_compaction(mock_get_client):
+    """Native Codex compaction does not use auxiliary.compression.*, so the
+    startup feasibility check must not warn about missing summary providers."""
+    agent = _make_agent(provider="openai-codex", codex_native=True)
+
+    messages = []
+    agent._emit_status = lambda msg: messages.append(msg)
+
+    agent._check_compression_model_feasibility()
+
+    mock_get_client.assert_not_called()
+    assert messages == []
+    assert agent._compression_warning is None
 
 
 @patch("agent.model_metadata.get_model_context_length", return_value=80_000)

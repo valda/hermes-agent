@@ -1265,6 +1265,9 @@ class SessionStore:
                     reasoning_details=message.get("reasoning_details") if message.get("role") == "assistant" else None,
                     codex_reasoning_items=message.get("codex_reasoning_items") if message.get("role") == "assistant" else None,
                     codex_message_items=message.get("codex_message_items") if message.get("role") == "assistant" else None,
+                    # Codex /responses/compact envelope is role-agnostic
+                    # (the marker message is synthesized as a user turn).
+                    codex_responses_items=message.get("_codex_responses_items"),
                 )
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)

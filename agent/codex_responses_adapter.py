@@ -252,6 +252,19 @@ def _chat_messages_to_responses_input(messages: List[Dict[str, Any]]) -> List[Di
     for msg in messages:
         if not isinstance(msg, dict):
             continue
+        # Compaction envelope: a side-channel field carrying verbatim
+        # Responses items (output of /responses/compact). Emit each item
+        # as-is and skip role-based dispatch.  See agent.codex_compactor.
+        codex_responses_items = msg.get("_codex_responses_items")
+        if isinstance(codex_responses_items, list) and codex_responses_items:
+            for raw in codex_responses_items:
+                if not isinstance(raw, dict):
+                    continue
+                # Strip id defensively; codex_compactor strips on insert too,
+                # but a hand-crafted envelope (or a session loaded from disk
+                # before id-stripping was added) may still carry one.
+                items.append({k: v for k, v in raw.items() if k != "id"})
+            continue
         role = msg.get("role")
         if role == "system":
             continue
@@ -499,13 +512,39 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                 normalized.append(reasoning_item)
             continue
 
+        if item_type == "compaction":
+            # Output of /responses/compact.  The encrypted_content is opaque
+            # to us but the Codex backend will decrypt and re-expand it on
+            # the next /responses call.  Same id-stripping rule as reasoning
+            # items (store=False can't look up by id → 404).
+            encrypted = item.get("encrypted_content")
+            if isinstance(encrypted, str) and encrypted:
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id:
+                    if item_id in seen_ids:
+                        continue
+                    seen_ids.add(item_id)
+                normalized.append({
+                    "type": "compaction",
+                    "encrypted_content": encrypted,
+                })
+            continue
+
         if item_type == "message":
             role = item.get("role")
-            if role != "assistant":
-                raise ValueError(f"Codex Responses input[{idx}] message items must have role='assistant'.")
+            if role not in {"assistant", "user"}:
+                raise ValueError(f"Codex Responses input[{idx}] message items must have role='assistant' or 'user'.")
             content = item.get("content")
             if not isinstance(content, list):
                 raise ValueError(f"Codex Responses input[{idx}] message item must have content list.")
+            # Codex compaction returns kept user messages as type=message
+            # items with input_text content; assistant messages (when
+            # surfaced by the transport) use output_text.  Accept both
+            # part types and emit the role-appropriate canonical form.
+            allowed_text_types = (
+                {"output_text", "text"} if role == "assistant" else {"input_text", "text"}
+            )
+            canonical_text_type = "output_text" if role == "assistant" else "input_text"
             normalized_content = []
             for part_idx, part in enumerate(content):
                 if not isinstance(part, dict):
@@ -513,21 +552,21 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                         f"Codex Responses input[{idx}] message content[{part_idx}] must be an object."
                     )
                 part_type = part.get("type")
-                if part_type not in {"output_text", "text"}:
+                if part_type not in allowed_text_types:
                     raise ValueError(
-                        f"Codex Responses input[{idx}] message content[{part_idx}] has unsupported type {part_type!r}."
+                        f"Codex Responses input[{idx}] message content[{part_idx}] has unsupported type {part_type!r} for role={role!r}."
                     )
                 text = part.get("text", "")
                 if text is None:
                     text = ""
                 if not isinstance(text, str):
                     text = str(text)
-                normalized_content.append({"type": "output_text", "text": text})
+                normalized_content.append({"type": canonical_text_type, "text": text})
             if not normalized_content:
                 raise ValueError(f"Codex Responses input[{idx}] message item must contain at least one text part.")
             normalized_item: Dict[str, Any] = {
                 "type": "message",
-                "role": "assistant",
+                "role": role,
                 "status": _normalize_responses_message_status(item.get("status")),
                 "content": normalized_content,
             }

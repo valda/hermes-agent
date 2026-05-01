@@ -113,14 +113,26 @@ class ChatCompletionsTransport(ProviderTransport):
         """Messages are already in OpenAI format — sanitize Codex leaks only.
 
         Strips Codex Responses API fields (``codex_reasoning_items`` /
-        ``codex_message_items`` on the message, ``call_id``/``response_item_id``
-        on tool_calls) that strict chat-completions providers reject with 400/422.
+        ``codex_message_items`` / ``_codex_responses_items`` on the message,
+        ``call_id``/``response_item_id`` on tool_calls) that strict
+        chat-completions providers reject with 400/422.
+
+        ``_codex_responses_items`` carries an opaque compaction envelope
+        produced by Codex's /responses/compact endpoint.  It is meaningful
+        only to the Codex transport; outside it, the envelope's plain-text
+        ``content`` (the human-readable label) survives but the encrypted
+        payload is dropped — switching off Codex mid-session loses any
+        compacted history, by design.
         """
         needs_sanitize = False
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
-            if "codex_reasoning_items" in msg or "codex_message_items" in msg:
+            if (
+                "codex_reasoning_items" in msg
+                or "codex_message_items" in msg
+                or "_codex_responses_items" in msg
+            ):
                 needs_sanitize = True
                 break
             tool_calls = msg.get("tool_calls")
@@ -141,6 +153,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 continue
             msg.pop("codex_reasoning_items", None)
             msg.pop("codex_message_items", None)
+            msg.pop("_codex_responses_items", None)
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:

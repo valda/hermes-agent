@@ -349,6 +349,37 @@ compression:
   # To pin a specific model/provider for compression summaries, use the
   # auxiliary section below (auxiliary.compression.provider / model).
 
+  # Native Codex compaction (opt-in, gated on main agent provider).
+  #
+  # When true *and* the main agent runs against the openai-codex provider,
+  # Hermes calls the Codex backend's POST /responses/compact endpoint
+  # instead of generating a plain-text summary.  The server returns kept
+  # user turns plus an opaque encrypted compaction item, which is
+  # replayed verbatim into subsequent /responses calls — preserving more
+  # of the model's latent state than a textual summary can.
+  #
+  # The endpoint reuses the same ChatGPT OAuth credentials and quota as
+  # the main agent; auxiliary.compression.* is ignored on this path.
+  #
+  # Trade-offs:
+  #  • The compacted history is opaque (you cannot read it in logs/UI).
+  #  • Decryptable only by the Codex backend, so switching the main
+  #    agent off Codex mid-session loses the compacted history.
+  #  • Uses the same ChatGPT subscription quota as the main agent.
+  #
+  # Contract change vs. the text-summary path:
+  #   On this path, head/tail protection (protect_first_n / protect_last_n /
+  #   "always keep latest user message") is delegated to the Codex backend's
+  #   /responses/compact keep policy.  The text-summary invariants above DO
+  #   NOT apply: the server alone decides which user turns are kept verbatim
+  #   and where the opaque compaction lands.  This matches codex-rs's
+  #   own remote-compaction design (the client sends the full history; the
+  #   server returns a replacement transcript).
+  #
+  # When the gate (main provider == openai-codex) is not satisfied, this
+  # flag is silently ignored and the text-summary path runs as usual.
+  codex_native: false
+
 # =============================================================================
 # Anthropic prompt caching TTL
 # =============================================================================

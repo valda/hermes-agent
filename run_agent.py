@@ -2010,6 +2010,10 @@ class AIAgent:
             if not self.quiet_mode:
                 logger.info("Using context engine: %s", _selected_engine.name)
         else:
+            _codex_native_compaction = bool(
+                isinstance(_compression_cfg, dict)
+                and str(_compression_cfg.get("codex_native", False)).lower() in ("true", "1", "yes")
+            )
             self.context_compressor = ContextCompressor(
                 model=self.model,
                 threshold_percent=compression_threshold,
@@ -2023,6 +2027,7 @@ class AIAgent:
                 config_context_length=_config_context_length,
                 provider=self.provider,
                 api_mode=self.api_mode,
+                codex_native=_codex_native_compaction,
             )
         self.compression_enabled = compression_enabled
 
@@ -2612,6 +2617,15 @@ class AIAgent:
         ``run_conversation()`` call.
         """
         if not self.compression_enabled:
+            return
+        if (
+            getattr(self.context_compressor, "codex_native", False)
+            and getattr(self.context_compressor, "provider", "") == "openai-codex"
+        ):
+            # Native Codex compaction reuses the main Codex OAuth credentials
+            # and does not call auxiliary.compression.*.  Running the auxiliary
+            # feasibility probe here would emit a misleading "compression will
+            # not work" warning for a path that never uses a summary model.
             return
         try:
             from agent.auxiliary_client import (
@@ -3784,6 +3798,9 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    # Codex /responses/compact envelope is role-agnostic
+                    # (the marker message is synthesized as a user turn).
+                    codex_responses_items=msg.get("_codex_responses_items"),
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
@@ -9041,6 +9058,27 @@ class AIAgent:
             # Plugin context engine with strict signature that doesn't accept
             # focus_topic — fall back to calling without it.
             compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+
+        # No-op detection: a compressor signals "skip this turn" by returning
+        # the very same list it was given (identity).  Both the
+        # "history is too short to bother" path and the Codex native
+        # envelope-protection path use this convention.  Treat it as a no-op:
+        # do NOT split the SQLite session, do NOT rebuild the system prompt,
+        # do NOT append a todo snapshot.  The caller's preflight loop will
+        # observe ``len(messages) >= len(orig)`` and break out.
+        #
+        # Without this guard, a no-op return still rotates the session_id and
+        # resets ``_last_flushed_db_idx`` — so any messages carrying an
+        # opaque ``_codex_responses_items`` envelope would never be flushed
+        # to the new session, defeating the DB persistence work that
+        # protects compacted history across resume / gateway restart.
+        if compressed is messages:
+            logger.info(
+                "context compression no-op (compressor returned input unchanged) "
+                "— skipping session split for session=%s",
+                self.session_id or "none",
+            )
+            return messages, system_message
 
         summary_error = getattr(self.context_compressor, "_last_summary_error", None)
         if summary_error:

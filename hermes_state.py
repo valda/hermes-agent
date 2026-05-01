@@ -94,6 +94,18 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+-- Experimental add-on (fix/codex-compaction): opaque /responses/compact
+-- envelopes attached to compaction marker messages.  Kept in a separate
+-- has_one table so the experiment can be rolled back with a single
+-- DROP TABLE without touching the main messages schema.  When this
+-- feature graduates upstream it can be folded into messages as a
+-- regular column via a future schema bump.
+CREATE TABLE IF NOT EXISTS codex_compaction_envelopes (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    items_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
@@ -1234,12 +1246,18 @@ class SessionDB:
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
+        codex_responses_items: Any = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
 
         Also increments the session's message_count (and tool_call_count
         if role is 'tool' or tool_calls is present).
+
+        ``codex_responses_items`` (experimental, fix/codex-compaction):
+        opaque ``/responses/compact`` envelope items.  Stored in the
+        separate ``codex_compaction_envelopes`` table so the experiment
+        can be removed without touching the main messages schema.
         """
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
@@ -1253,6 +1271,10 @@ class SessionDB:
         codex_message_items_json = (
             json.dumps(codex_message_items)
             if codex_message_items else None
+        )
+        codex_responses_items_json = (
+            json.dumps(codex_responses_items)
+            if codex_responses_items else None
         )
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
@@ -1289,6 +1311,14 @@ class SessionDB:
                 ),
             )
             msg_id = cursor.lastrowid
+
+            if codex_responses_items_json:
+                conn.execute(
+                    """INSERT INTO codex_compaction_envelopes
+                       (message_id, items_json, created_at)
+                       VALUES (?, ?, ?)""",
+                    (msg_id, codex_responses_items_json, time.time()),
+                )
 
             # Update counters
             if num_tool_calls > 0:
@@ -1336,6 +1366,9 @@ class SessionDB:
                 codex_message_items = (
                     msg.get("codex_message_items") if role == "assistant" else None
                 )
+                # Experimental envelope is role-agnostic (compaction marker
+                # is a synthetic user turn).  Don't gate on role.
+                codex_responses_items = msg.get("_codex_responses_items")
 
                 reasoning_details_json = (
                     json.dumps(reasoning_details) if reasoning_details else None
@@ -1346,9 +1379,12 @@ class SessionDB:
                 codex_message_items_json = (
                     json.dumps(codex_message_items) if codex_message_items else None
                 )
+                codex_responses_items_json = (
+                    json.dumps(codex_responses_items) if codex_responses_items else None
+                )
                 tool_calls_json = json.dumps(tool_calls) if tool_calls else None
 
-                conn.execute(
+                cursor = conn.execute(
                     """INSERT INTO messages (session_id, role, content, tool_call_id,
                        tool_calls, tool_name, timestamp, token_count, finish_reason,
                        reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
@@ -1371,6 +1407,14 @@ class SessionDB:
                         codex_message_items_json,
                     ),
                 )
+                msg_id = cursor.lastrowid
+                if codex_responses_items_json:
+                    conn.execute(
+                        """INSERT INTO codex_compaction_envelopes
+                           (message_id, items_json, created_at)
+                           VALUES (?, ?, ?)""",
+                        (msg_id, codex_responses_items_json, now_ts),
+                    )
                 total_messages += 1
                 if tool_calls is not None:
                     total_tool_calls += (
@@ -1389,7 +1433,11 @@ class SessionDB:
         """Load all messages for a session, ordered by timestamp."""
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
+                "SELECT m.*, e.items_json AS _codex_envelope_items_json "
+                "FROM messages m "
+                "LEFT JOIN codex_compaction_envelopes e ON e.message_id = m.id "
+                "WHERE m.session_id = ? "
+                "ORDER BY m.timestamp, m.id",
                 (session_id,),
             )
             rows = cursor.fetchall()
@@ -1404,6 +1452,14 @@ class SessionDB:
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
                     msg["tool_calls"] = []
+            envelope_json = msg.pop("_codex_envelope_items_json", None)
+            if envelope_json:
+                try:
+                    msg["_codex_responses_items"] = json.loads(envelope_json)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize _codex_responses_items envelope; dropping"
+                    )
             result.append(msg)
         return result
 
@@ -1486,10 +1542,14 @@ class SessionDB:
         with self._lock:
             placeholders = ",".join("?" for _ in session_ids)
             rows = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, "
-                "finish_reason, reasoning, reasoning_content, reasoning_details, "
-                "codex_reasoning_items, codex_message_items "
-                f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY timestamp, id",
+                "SELECT m.role, m.content, m.tool_call_id, m.tool_calls, m.tool_name, "
+                "m.finish_reason, m.reasoning, m.reasoning_content, m.reasoning_details, "
+                "m.codex_reasoning_items, m.codex_message_items, "
+                "e.items_json AS _codex_envelope_items_json "
+                "FROM messages m "
+                "LEFT JOIN codex_compaction_envelopes e ON e.message_id = m.id "
+                f"WHERE m.session_id IN ({placeholders}) "
+                "ORDER BY m.timestamp, m.id",
                 tuple(session_ids),
             ).fetchall()
 
@@ -1537,6 +1597,14 @@ class SessionDB:
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("Failed to deserialize codex_message_items, falling back to None")
                         msg["codex_message_items"] = None
+            envelope_json = row["_codex_envelope_items_json"]
+            if envelope_json:
+                try:
+                    msg["_codex_responses_items"] = json.loads(envelope_json)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize _codex_responses_items envelope; dropping"
+                    )
             if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
                 continue
             messages.append(msg)
