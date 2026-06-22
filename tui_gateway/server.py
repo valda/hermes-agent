@@ -9832,6 +9832,8 @@ def _(rid, params: dict) -> dict:
             from hermes_constants import parse_reasoning_effort
 
             arg = str(value or "").strip().lower()
+            scope = str(params.get("scope") or "").strip().lower()
+            global_scope = scope == "global"
             if arg in {"show", "on"}:
                 cfg = _load_cfg()
                 display = (
@@ -9911,7 +9913,12 @@ def _(rid, params: dict) -> dict:
             parsed = parse_reasoning_effort(arg)
             if parsed is None:
                 return _err(rid, 4002, f"unknown reasoning value: {value}")
-            _write_config_key("agent.reasoning_effort", arg)
+            if global_scope or session is None:
+                _write_config_key("agent.reasoning_effort", arg)
+                if session is not None:
+                    session.pop("create_reasoning_override", None)
+            else:
+                session["create_reasoning_override"] = parsed
             if session and session.get("agent") is not None:
                 session["agent"].reasoning_config = parsed
                 _persist_live_session_runtime(session)
@@ -10594,9 +10601,26 @@ def _(rid, params: dict) -> dict:
         )
     if key == "reasoning":
         cfg = _load_cfg()
-        effort = str(
-            (cfg.get("agent") or {}).get("reasoning_effort", "medium") or "medium"
-        )
+        session = _sessions.get(params.get("session_id", ""))
+        reasoning_config = None
+        if session is not None:
+            if isinstance(session.get("create_reasoning_override"), dict):
+                reasoning_config = session.get("create_reasoning_override")
+            else:
+                agent = session.get("agent")
+                agent_reasoning = getattr(agent, "reasoning_config", None)
+                if isinstance(agent_reasoning, dict):
+                    reasoning_config = agent_reasoning
+
+        if isinstance(reasoning_config, dict):
+            if reasoning_config.get("enabled") is False:
+                effort = "none"
+            else:
+                effort = str(reasoning_config.get("effort") or "medium")
+        else:
+            effort = str(
+                (cfg.get("agent") or {}).get("reasoning_effort", "medium") or "medium"
+            )
         display = (
             "show"
             if bool((cfg.get("display") or {}).get("show_reasoning", False))
