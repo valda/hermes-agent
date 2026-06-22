@@ -20,6 +20,9 @@ import { patchUiState } from '../../uiStore.js'
 import type { SlashCommand } from '../types.js'
 
 const TUI_SESSION_MODEL_RE = new RegExp(`(?:^|\\s)${TUI_SESSION_MODEL_FLAG}(?:\\s|$)`)
+const REASONING_SESSION_FLAGS = new Set(['--session'])
+const REASONING_EFFORT_VALUES = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+
 const modelValueForConfigSet = (arg: string) => {
   const trimmed = arg.trim()
 
@@ -32,6 +35,33 @@ const modelValueForConfigSet = (arg: string) => {
   }
 
   return trimmed
+}
+
+const reasoningConfigPayload = (arg: string, sid: string) => {
+  const parts = arg.trim().split(/\s+/).filter(Boolean)
+  let scope = ''
+  const valueParts: string[] = []
+
+  for (const part of parts) {
+    const flag = part.toLowerCase()
+    if (REASONING_SESSION_FLAGS.has(flag)) {
+      scope = 'session'
+      continue
+    }
+    valueParts.push(part)
+  }
+
+  const value = valueParts.join(' ')
+  if (!scope && REASONING_EFFORT_VALUES.has(value.toLowerCase())) {
+    scope = 'global'
+  }
+
+  return {
+    key: 'reasoning',
+    session_id: sid,
+    value,
+    ...(scope ? { scope } : {})
+  }
 }
 
 export const sessionCommands: SlashCommand[] = [
@@ -441,7 +471,7 @@ export const sessionCommands: SlashCommand[] = [
     run: (arg, ctx) => {
       if (!arg) {
         return ctx.gateway
-          .rpc<ConfigGetValueResponse>('config.get', { key: 'reasoning' })
+          .rpc<ConfigGetValueResponse>('config.get', { key: 'reasoning', session_id: ctx.sid })
           .then(
             ctx.guarded<ConfigGetValueResponse>(
               r => r.value && ctx.transcript.sys(`reasoning: ${r.value} · display ${r.display || 'hide'}`)
@@ -449,29 +479,31 @@ export const sessionCommands: SlashCommand[] = [
           )
       }
 
-      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'reasoning', session_id: ctx.sid, value: arg }).then(
-        ctx.guarded<ConfigSetResponse>(r => {
-          if (!r.value) {
-            return
-          }
+      ctx.gateway
+        .rpc<ConfigSetResponse>('config.set', reasoningConfigPayload(arg, ctx.sid ?? ''))
+        .then(
+          ctx.guarded<ConfigSetResponse>(r => {
+            if (!r.value) {
+              return
+            }
 
-          if (r.value === 'hide') {
-            patchUiState(state => ({
-              ...state,
-              sections: { ...state.sections, thinking: 'hidden' },
-              showReasoning: false
-            }))
-          } else if (r.value === 'show') {
-            patchUiState(state => ({
-              ...state,
-              sections: { ...state.sections, thinking: 'expanded' },
-              showReasoning: true
-            }))
-          }
+            if (r.value === 'hide') {
+              patchUiState(state => ({
+                ...state,
+                sections: { ...state.sections, thinking: 'hidden' },
+                showReasoning: false
+              }))
+            } else if (r.value === 'show') {
+              patchUiState(state => ({
+                ...state,
+                sections: { ...state.sections, thinking: 'expanded' },
+                showReasoning: true
+              }))
+            }
 
-          ctx.transcript.sys(`reasoning: ${r.value}`)
-        })
-      )
+            ctx.transcript.sys(`reasoning: ${r.value}`)
+          })
+        )
     }
   },
 
