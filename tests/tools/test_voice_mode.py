@@ -974,15 +974,21 @@ class TestPlayAudioFile:
         monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}" if cmd in {"ffplay", "aplay"} else None)
 
         mock_proc = MagicMock()
-        mock_proc.wait.side_effect = [subprocess.TimeoutExpired(["ffplay"], 300), 0]
+        mock_proc.wait.side_effect = [
+            subprocess.TimeoutExpired(["ffplay"], 300),
+            subprocess.TimeoutExpired(["ffplay"], 10),
+        ]
         mock_popen = MagicMock(return_value=mock_proc)
         monkeypatch.setattr("subprocess.Popen", mock_popen)
 
+        import tools.voice_mode as voice_mode
         from tools.voice_mode import play_audio_file
 
         assert play_audio_file(sample_wav) is False
         assert mock_popen.call_count == 1
+        assert mock_proc.wait.call_count == 2
         mock_proc.kill.assert_called_once()
+        assert voice_mode._active_playback is None
 
 
 # ============================================================================
